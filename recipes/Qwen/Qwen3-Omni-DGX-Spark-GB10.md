@@ -1,11 +1,9 @@
 # Qwen3-Omni on NVIDIA DGX Spark (GB10)
 
-> **Qualification revision:** locally built image with vLLM-Omni package commit
-> `f1a6e7ce`, vLLM 0.29.0, on a single DGX Spark. The exact GB10 YAML below
-> has been verified by matching host/container SHA256 hashes and two successful
-> audio-input requests. This is not a claim of support on every upstream release.
-> The exact local image build has not been reconstructed; a public upstream
-> Docker build path is documented below but is not yet re-qualified on GB10.
+> **Qualification revision:** vLLM-Omni `f1a6e7ce` with vLLM 0.29.0
+> on one NVIDIA DGX Spark GB10 (aarch64). The pinned deployment YAML and a
+> clean-source build from the official vLLM base passed text/audio inference
+> checks. This does not qualify Realtime VAD, native Duplex, or other releases.
 
 ## Summary
 
@@ -60,69 +58,113 @@ runtime allocator measurements with their definitions clearly stated.
 
 ## Software environment
 
-- Runtime: locally built Docker image
-  `vllm-omni:0.29.0-aarch64-main-f1a6e7ce-m1` (**not a published upstream image**).
-- Source baseline: `vllm-omni` commit `f1a6e7ce`, as identified by package
-  metadata and Docker build history. The final installation used an existing
-  dependency environment; a clean rebuild was not completed, and the absence
-  of local source patches has not been independently established.
-- Container Python: **3.12.3**.
-- Container vLLM: **0.29.0**.
-- Container vLLM-Omni package: **0.0.0.dev0+gf1a6e7ce**.
-- Container PyTorch: **2.13.0+cu130**; PyTorch CUDA runtime: **13.0**.
-- Container Transformers: **5.14.1**.
-- Container image was built locally. Verify build instructions and absence of local source patches before publishing; the package version alone is not proof of an unmodified upstream build.
+- Base image: `vllm/vllm-openai:v0.29.0` (aarch64).
+- Independently built image: `vllm-omni:gb10-f1a6e7ce-repro-final`
+  (local qualification tag; not an upstream-published image).
+- Source: clean Git archive of upstream commit `f1a6e7ce`.
+- Python: 3.12.3; vLLM: 0.29.0; vLLM-Omni: `0.0.0.dev0+gf1a6e7ce`.
+- PyTorch: `2.13.0+cu130`; CUDA runtime: 13.0.
+- Transformers: 5.14.1.
+- Dependency overlay: 61 pinned Python packages, including two wheels
+  locally built from source distributions.
 
-The host-side `vllm-omni-pr7759` Python environment is **not** the runtime
-of this deployment; its package versions must not be substituted here.
+An earlier local image used a preinstalled vLLM-Omni environment and
+was not independently reproducible from the public base. The build below
+starts from the official vLLM image, exports unmodified pinned upstream
+source, installs its dependency overlay offline, and has now passed
+text and audio inference on the same GB10 host. It does not claim
+bit-for-bit reproducibility of Docker layers or externally sourced wheels.
 
-### Image provenance and build limitations
+### Reproduced image build
 
-The qualified image was built locally and is not an official published image.
-Its Docker history shows that it was derived from a previously prepared
-vLLM-Omni image and that the final source installation used:
+Use a checkout containing this recipe (the PR branch before merge; the
+upstream branch after merge). Docker and the ARM64
+`vllm/vllm-openai:v0.29.0` image must be available locally. The model
+weights are separate and are **not** part of the image build.
 
-```bash
-VLLM_OMNI_VERSION_OVERRIDE=0.0.0.dev0+gf1a6e7ce uv pip install --no-build-isolation --no-deps --reinstall "."
-```
-
-The `--no-deps` flag reused dependencies already installed in the parent
-image. This final installation step does not constitute a reproducible
-installation from a clean environment.
-
-At the pinned revision, the upstream `docker/Dockerfile.cuda` uses
-`vllm/vllm-openai:v0.29.0` as its base image. An attempted fresh rebuild
-required an explicit version override because the Docker build context did
-not provide usable Git metadata. After resolving the version, the build
-failed while downloading `nvidia-cusparselt-cu13==0.8.1` due to a network
-timeout.
-
-Consequently, the reported inference results qualify the pinned local
-image and YAML profile, not a successfully rebuilt clean upstream image.
-A fresh installation must resolve the required dependencies separately
-and repeat the verification tests.
-
-### Fresh image build (not yet qualified)
-
-The validated local image is not publicly distributed. To prepare a
-fresh image from the pinned upstream source, use the following procedure
-on an ARM64 CUDA host with access to the required Python packages:
+First export the pinned upstream code and prepare the build context:
 
 ```bash
-git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm-omni
-git checkout f1a6e7ce
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+RECIPE_DIR="$REPO_ROOT/recipes/Qwen"
+CTX="$HOME/gb10-repro-build"
+PINNED_COMMIT=f1a6e7ce2a8fceb1417ec86b0b49a6386601ac65
 
-sed '/^RUN cd .*vllm-omni && uv pip install/i ARG VLLM_OMNI_VERSION_OVERRIDE=0.0.0.dev0+gf1a6e7ce'   docker/Dockerfile.cuda > /tmp/Dockerfile.gb10
+# Ensure the historical pinned commit is available even in a shallow clone.
+git -C "$REPO_ROOT" cat-file -e "$PINNED_COMMIT^{commit}" || \
+  git -C "$REPO_ROOT" fetch origin "$PINNED_COMMIT"
+mkdir -p "$CTX/src" "$CTX/wheelhouse" "$CTX/sdists"
+git -C "$REPO_ROOT" archive "$PINNED_COMMIT" | tar -xf - -C "$CTX/src"
+cp "$RECIPE_DIR/Qwen3-Omni-DGX-Spark-GB10.Dockerfile" "$CTX/Dockerfile"
+cp "$RECIPE_DIR/Qwen3-Omni-DGX-Spark-GB10-wheel-pins.txt" "$CTX/wheel-pins.txt"
 
-docker build --pull=false   -f /tmp/Dockerfile.gb10   --build-arg BASE_IMAGE=vllm/vllm-openai:v0.29.0   -t vllm-omni:gb10-f1a6e7ce .
+# Two packages require building wheels from source distributions.
+grep -vE '^(#|$|antlr4-python3-runtime==|openai-whisper==)' \
+  "$CTX/wheel-pins.txt" > "$CTX/binary-pins.txt"
 ```
 
-This procedure was attempted but did not complete because downloading
-an ARM64 CUDA dependency timed out. It is therefore an **unverified
-fresh-build path**, not the image used for the measurements below.
-If this build succeeds, substitute `vllm-omni:gb10-f1a6e7ce` in the
-serving command and re-run the verification tests.
+Prepare all 61 wheels using the Tsinghua PyPI mirror, without a proxy.
+Downloads happen in a temporary container; this does not change the
+installed packages of the base image:
+
+```bash
+docker run --rm --pull never --network host \
+  -v "$CTX:/work" --entrypoint bash vllm/vllm-openai:v0.29.0 -lc '
+    set -euo pipefail
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+    unset PIP_PROXY pip_proxy
+    export NO_PROXY="*" no_proxy="*"
+    python3 -m pip download --only-binary=:all: --no-deps \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      -r /work/binary-pins.txt -d /work/wheelhouse
+    python3 -m pip download --no-deps --no-binary=:all: \
+      --no-build-isolation \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      -d /work/sdists \
+      antlr4-python3-runtime==4.9.3 openai-whisper==20250625
+    python3 -m pip wheel --no-index --no-deps --no-build-isolation \
+      --wheel-dir /work/wheelhouse /work/sdists/*.tar.gz
+  '
+test "$(find "$CTX/wheelhouse" -maxdepth 1 -name '*.whl' | wc -l)" -eq 61
+```
+
+Build without network access using the adjacent Dockerfile, whose install
+steps use `--no-deps` to preserve vLLM, PyTorch and CUDA from the base:
+
+```bash
+docker build --pull=false --network=none \
+  -f "$CTX/Dockerfile" \
+  -t vllm-omni:gb10-f1a6e7ce-repro-final "$CTX"
+# The base image has two known pip-check findings.
+# Verify that no additional dependency problems were introduced.
+set +e
+docker run --rm --pull never --network none --entrypoint python3 \
+  vllm-omni:gb10-f1a6e7ce-repro-final -m pip check \
+  > "$CTX/pip-check.txt" 2>&1
+check_rc=$?
+set -e
+
+cat "$CTX/pip-check.txt"
+test "$check_rc" -eq 1
+test "$(wc -l < "$CTX/pip-check.txt")" -eq 2
+grep -Fq 'nvidia-nccl-cu13==2.29.7' "$CTX/pip-check.txt"
+grep -Fq 'nvidia-cusparselt-cu13 0.8.1 is not supported' \
+  "$CTX/pip-check.txt"
+
+```
+
+This sequence was executed on a DGX Spark GB10. The full wheelhouse
+contains 61 packages (approximately 243 MiB). Following the final
+build, `pip check` reported **only two existing base-image issues**:
+
+- PyTorch requires `nvidia-nccl-cu13==2.29.7`, but the base contains 2.30.7.
+- `nvidia-cusparselt-cu13==0.8.1` reports an unsupported platform.
+
+The source of those two warnings was verified against the unchanged
+upstream vLLM base; there were no additional missing Python dependencies.
+The supplied pin list reproduces the tested package versions but does not
+include independent download hashes for all wheel artifacts.
 
 ## Command
 
@@ -144,14 +186,14 @@ Replace `/path/to/model` and `/path/to/profile` with local paths:
 
 ```bash
 # Verify the container image is locally available and record its provenance.
-docker image inspect vllm-omni:0.29.0-aarch64-main-f1a6e7ce-m1 >/dev/null
+docker image inspect vllm-omni:gb10-f1a6e7ce-repro-final >/dev/null
 
 # Validated GB10 profile; use the named file in this recipe.
 docker run --rm --name qwen3-omni-gb10 \
   --gpus all --ipc host --network host \
   -v /path/to/model:/models/Qwen3-Omni-30B-A3B-Instruct:ro \
   -v /path/to/profile:/workspace/gb10.yaml:ro \
-  vllm-omni:0.29.0-aarch64-main-f1a6e7ce-m1 \
+  vllm-omni:gb10-f1a6e7ce-repro-final \
   vllm serve /models/Qwen3-Omni-30B-A3B-Instruct \
   --omni --port 8093 --deploy-config /workspace/gb10.yaml
 ```
@@ -230,8 +272,8 @@ For the repository's more general payload builder, see the
 
 ## Measured latency and memory
 
-Measurements below are from **one** DGX Spark, the locally built image named
-above, and a single concurrent HTTP request. They are not Realtime TTFA or
+Measurements below are from **one** DGX Spark, the earlier local
+qualification image, and a single concurrent HTTP request. They are not Realtime TTFA or
 throughput numbers.
 
 | Workload | Samples | Client completion time | Result |
@@ -257,6 +299,27 @@ memory, **not** peak model allocation, and does not capture the startup peak.
 The script sampled `/proc/meminfo` at 0.5 s intervals. Other host workloads
 may change this value.
 
+### Independently rebuilt image verification
+
+The following requests ran with the same pinned GB10 YAML and one
+concurrent `/v1/chat/completions` HTTP request. Latencies are end-to-end
+complete-response times, **not** time-to-first-audio.
+
+| Image | Input | First measured request | Subsequent warm requests |
+| --- | --- | ---: | --- |
+| `repro-test` | Text | 38.775 s | 1.736 s, 1.610 s |
+| `repro-test` | WAV | 41.079 s | 2.078 s, 2.100 s |
+| `repro-final` | Text | 36.284 s | Not measured |
+| `repro-final` | WAV | 38.960 s | Not measured |
+
+Both rebuilt images returned Chinese text and valid 24 kHz mono speech.
+The audio-input fixture contained the spoken codename "Orchid Falcon",
+which the model recovered correctly. Long first-request times are
+consistent with one-time warm-up, but the precise cause was not
+independently established. The warm timings were measured on `repro-test`
+before the final `onnx`/`pre-commit` dependency additions, not on
+`repro-final`. Neither multi-turn history nor Realtime duplex was tested.
+
 ## Notes
 
 - The working three-stage memory-utilization configuration was 0.52 / 0.09 /
@@ -268,9 +331,9 @@ may change this value.
   benchmarks above measured **fully completed non-streaming responses**.
 - Tool calling, client interruption, Server VAD and native duplex are outside
   this hardware qualification.
-- The validated clean profile's SHA256 was checked both on the host and inside
-  the container. Rebuild and re-qualify the public upstream Dockerfile before publication;
-  disclose any local changes if they are still required.
+- The validated profile's SHA256 was checked on the host and in the
+  container. The independent build uses unmodified pinned upstream
+  source and the documented dependency overlay.
 
 ## Supported features
 
