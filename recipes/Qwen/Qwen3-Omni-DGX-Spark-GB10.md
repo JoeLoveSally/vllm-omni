@@ -4,6 +4,10 @@
 > on one NVIDIA DGX Spark GB10 (aarch64). The pinned deployment YAML and a
 > clean-source build from the official vLLM base passed text/audio inference
 > checks. This does not qualify Realtime VAD, native Duplex, or other releases.
+>
+> **Current main:** Not validated. This YAML targets the pinned
+> `f1a6e7ce` deployment schema; compatibility with current main must
+> be checked separately.
 
 ## Summary
 
@@ -21,6 +25,14 @@ Code2Wav) together on a **single DGX Spark GB10**. The default multi-GPU
 model configuration is not suitable as-is for the single-GPU topology.
 The profile has `max_num_seqs: 1` for all three stages and prioritizes
 single-request operation over concurrency.
+
+Stage 0 uses `max_model_len: 8192`, which limits the total prompt
+length, including multimodal tokens. Longer audio and image/video
+inputs may exceed this limit. Increasing it requires checking KV-cache
+capacity and memory headroom under the GB10 Stage 0
+`gpu_memory_utilization: 0.52` setting. The safe maximum above 8192 is
+unknown; no higher limit was qualified. Do not increase it without a new
+KV-cache and memory-headroom test on GB10.
 
 ## Supported model contract
 
@@ -68,6 +80,23 @@ runtime allocator measurements with their definitions clearly stated.
 - Dependency overlay: 61 pinned Python packages, including two wheels
   locally built from source distributions.
 
+The overlay retains several packages normally associated with development
+or verification tooling because they are unconditional transitive
+dependencies in the pinned distribution metadata:
+
+- `s3tokenizer==0.3.0` requires `pre-commit`, which requires `cfgv`,
+  `identify`, `nodeenv`, and `virtualenv`.
+- `kernels==0.16.1` requires `sigstore>=4,<5` and `tomlkit>=0.13.3`.
+  Sigstore introduces dependencies including `tuf`, `rfc3161-client`,
+  and `sigstore-rekor-types`.
+
+These dependencies were checked against installed package metadata on
+the qualified GB10 image. Their inclusion preserves the declared
+dependency closure for the offline `--no-deps` installation; it does
+not establish that every package is imported by Qwen3-Omni inference.
+Removing them requires separate validation or a change to the upstream
+dependency declarations.
+
 An earlier local image used a preinstalled vLLM-Omni environment and
 was not independently reproducible from the public base. The build below
 starts from the official vLLM image, exports unmodified pinned upstream
@@ -77,94 +106,143 @@ bit-for-bit reproducibility of Docker layers or externally sourced wheels.
 
 ### Reproduced image build
 
-Use a checkout containing this recipe (the PR branch before merge; the
-upstream branch after merge). Docker and the ARM64
-`vllm/vllm-openai:v0.29.0` image must be available locally. The model
-weights are separate and are **not** part of the image build.
-
-First export the pinned upstream code and prepare the build context:
-
-```bash
-set -euo pipefail
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-RECIPE_DIR="$REPO_ROOT/recipes/Qwen"
-CTX="$HOME/gb10-repro-build"
-PINNED_COMMIT=f1a6e7ce2a8fceb1417ec86b0b49a6386601ac65
-
-# Ensure the historical pinned commit is available even in a shallow clone.
-git -C "$REPO_ROOT" cat-file -e "$PINNED_COMMIT^{commit}" || \
-  git -C "$REPO_ROOT" fetch origin "$PINNED_COMMIT"
-mkdir -p "$CTX/src" "$CTX/wheelhouse" "$CTX/sdists"
-git -C "$REPO_ROOT" archive "$PINNED_COMMIT" | tar -xf - -C "$CTX/src"
-cp "$RECIPE_DIR/Qwen3-Omni-DGX-Spark-GB10.Dockerfile" "$CTX/Dockerfile"
-cp "$RECIPE_DIR/Qwen3-Omni-DGX-Spark-GB10-wheel-pins.txt" "$CTX/wheel-pins.txt"
-
-# Two packages require building wheels from source distributions.
-grep -vE '^(#|$|antlr4-python3-runtime==|openai-whisper==)' \
-  "$CTX/wheel-pins.txt" > "$CTX/binary-pins.txt"
-```
-
-Prepare all 61 wheels using the Tsinghua PyPI mirror, without a proxy.
-Downloads happen in a temporary container; this does not change the
-installed packages of the base image:
+Use a checkout containing this recipe on an ARM64 DGX Spark with the official
+`vllm/vllm-openai:v0.29.0` image available locally. Model weights are not
+part of the image. The commands below run in a child Bash process and do not
+change the calling shell's options. The package index defaults to PyPI; on a
+network requiring a mirror, set `PIP_INDEX_URL` (for example, to
+`https://pypi.tuna.tsinghua.edu.cn/simple`) before running the block.
 
 ```bash
-docker run --rm --pull never --network host \
-  -v "$CTX:/work" --entrypoint bash vllm/vllm-openai:v0.29.0 -lc '
-    set -euo pipefail
-    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
-    unset PIP_PROXY pip_proxy
-    export NO_PROXY="*" no_proxy="*"
-    python3 -m pip download --only-binary=:all: --no-deps \
-      -i https://pypi.tuna.tsinghua.edu.cn/simple \
-      -r /work/binary-pins.txt -d /work/wheelhouse
-    python3 -m pip download --no-deps --no-binary=:all: \
-      --no-build-isolation \
-      -i https://pypi.tuna.tsinghua.edu.cn/simple \
-      -d /work/sdists \
-      antlr4-python3-runtime==4.9.3 openai-whisper==20250625
-    python3 -m pip wheel --no-index --no-deps --no-build-isolation \
-      --wheel-dir /work/wheelhouse /work/sdists/*.tar.gz
-  '
-test "$(find "$CTX/wheelhouse" -maxdepth 1 -name '*.whl' | wc -l)" -eq 61
+bash <<'GB10_BUILD'
+build_gb10_image() {
+  local repo ctx base commit image base_rc built_rc
+  repo="$(git rev-parse --show-toplevel)" || return 1
+  base=vllm/vllm-openai:v0.29.0
+  commit=f1a6e7ce2a8fceb1417ec86b0b49a6386601ac65
+  image="vllm-omni:gb10-repro-check-$(date +%Y%m%d%H%M%S)-$$"
+  ctx="$(mktemp -d "$HOME/gb10-repro-build.XXXXXX")" || return 1
+  echo "Build context: $ctx"
+  mkdir -p "$ctx/src" "$ctx/wheelhouse" "$ctx/sdists" "$ctx/verified" || return 1
+
+  docker image inspect "$base" >/dev/null 2>&1 || return 1
+  git -C "$repo" cat-file -e "$commit^{commit}" 2>/dev/null ||
+    git -C "$repo" fetch origin "$commit" || return 1
+  git -C "$repo" archive --format=tar -o "$ctx/src.tar" "$commit" || return 1
+  tar -xf "$ctx/src.tar" -C "$ctx/src" || return 1
+  rm "$ctx/src.tar" || return 1
+  cp "$repo/recipes/Qwen/Qwen3-Omni-DGX-Spark-GB10.Dockerfile" \
+    "$ctx/Dockerfile" || return 1
+  cp "$repo/recipes/Qwen/Qwen3-Omni-DGX-Spark-GB10-wheel-pins.txt" \
+    "$ctx/wheel-pins.txt" || return 1
+  grep -vE '^(#|$|antlr4-python3-runtime==|openai-whisper==)' \
+    "$ctx/wheel-pins.txt" > "$ctx/binary-pins.txt" || return 1
+
+  # Forward proxy variables only when configured.
+  local -a proxy_opts=()
+  local key
+  for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+             http_proxy https_proxy all_proxy no_proxy; do
+    if [ -n "${!key:-}" ]; then proxy_opts+=(-e "$key=${!key}"); fi
+  done
+
+  docker run --rm --pull never --network host \
+    -e "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}" \
+    "${proxy_opts[@]}" -v "$ctx:/work" --entrypoint bash "$base" -lc '
+      python3 -m pip download --only-binary=:all: --no-deps \
+        -r /work/binary-pins.txt -d /work/wheelhouse &&
+      python3 -m pip download --no-deps --no-binary=:all: \
+        --no-build-isolation -d /work/sdists \
+        antlr4-python3-runtime==4.9.3 openai-whisper==20250625 &&
+      python3 -m pip wheel --no-index --no-deps --no-build-isolation \
+        --wheel-dir /work/wheelhouse /work/sdists/*.tar.gz
+    ' || return 1
+
+  # Resolve every pinned requirement from the offline wheelhouse.
+  docker run --rm --pull never --network none -v "$ctx:/work" \
+    --entrypoint python3 "$base" -m pip download --no-index --no-deps \
+    --find-links /work/wheelhouse -r /work/wheel-pins.txt \
+    -d /work/verified || return 1
+
+  local expected actual
+  expected="$(grep -cE '^[^#[:space:]]' "$ctx/wheel-pins.txt")" || return 1
+  actual="$(find "$ctx/wheelhouse" -maxdepth 1 -name '*.whl' | wc -l)"
+  if [ "$actual" -ne "$expected" ]; then
+    echo "ERROR: wheel count mismatch ($actual != $expected)" >&2
+    return 1
+  fi
+
+  # Keep only files required by Dockerfile COPY instructions.
+  rm -rf "$ctx/sdists" "$ctx/verified" || return 1
+  rm -f "$ctx/wheel-pins.txt" "$ctx/binary-pins.txt" || return 1
+
+  docker build --pull=false --network=none -f "$ctx/Dockerfile" \
+    -t "$image" "$ctx" || return 1
+
+  docker run --rm --pull never --network none --entrypoint python3 \
+    "$base" -m pip check > "$ctx/base-check.txt" 2>&1
+  base_rc=$?
+  docker run --rm --pull never --network none --entrypoint python3 \
+    "$image" -m pip check > "$ctx/image-check.txt" 2>&1
+  built_rc=$?
+
+  python3 - "$ctx/base-check.txt" "$ctx/image-check.txt" \
+    "$base_rc" "$built_rc" <<'CHECK' || return 1
+from pathlib import Path
+import re
+import sys
+
+def read(path, rc):
+    lines = {
+        line.strip()
+        for line in Path(path).read_text().splitlines()
+        if line.strip() and line.strip() != "No broken requirements found."
+    }
+
+    if rc not in (0, 1) or (rc == 0 and lines) or (rc == 1 and not lines):
+        raise SystemExit(f"Unexpected pip check result: rc={rc}, {path}")
+
+    for line in lines:
+        requirement = re.fullmatch(
+            r"^.+ has requirement .+, but you have .+\.?$", line
+        )
+        platform_warning = re.fullmatch(
+            r"^.+ is not supported on this platform\.?$", line
+        )
+        if not (requirement or platform_warning):
+            raise SystemExit(
+                f"Unexpected pip check output; possible Docker error: {line}"
+            )
+
+    return lines
+
+base = read(sys.argv[1], int(sys.argv[3]))
+image = read(sys.argv[2], int(sys.argv[4]))
+new = image - base
+if new:
+    raise SystemExit(f"New dependency findings: {sorted(new)}")
+print("No additional pip check findings compared with the base image.")
+CHECK
+  echo "Build validated (not inference-qualified): $image"
+  echo "Build context: $ctx"
+}
+
+if build_gb10_image; then
+  echo "Image build and dependency checks passed."
+else
+  echo "ERROR: build or dependency checks failed; existing images remain unchanged." >&2
+  false
+fi
+GB10_BUILD
 ```
 
-Build without network access using the adjacent Dockerfile, whose install
-steps use `--no-deps` to preserve vLLM, PyTorch and CUDA from the base:
-
-```bash
-docker build --pull=false --network=none \
-  -f "$CTX/Dockerfile" \
-  -t vllm-omni:gb10-f1a6e7ce-repro-final "$CTX"
-# The base image has two known pip-check findings.
-# Verify that no additional dependency problems were introduced.
-set +e
-docker run --rm --pull never --network none --entrypoint python3 \
-  vllm-omni:gb10-f1a6e7ce-repro-final -m pip check \
-  > "$CTX/pip-check.txt" 2>&1
-check_rc=$?
-set -e
-
-cat "$CTX/pip-check.txt"
-test "$check_rc" -eq 1
-test "$(wc -l < "$CTX/pip-check.txt")" -eq 2
-grep -Fq 'nvidia-nccl-cu13==2.29.7' "$CTX/pip-check.txt"
-grep -Fq 'nvidia-cusparselt-cu13 0.8.1 is not supported' \
-  "$CTX/pip-check.txt"
-
-```
-
-This sequence was executed on a DGX Spark GB10. The full wheelhouse
-contains 61 packages (approximately 243 MiB). Following the final
-build, `pip check` reported **only two existing base-image issues**:
-
-- PyTorch requires `nvidia-nccl-cu13==2.29.7`, but the base contains 2.30.7.
-- `nvidia-cusparselt-cu13==0.8.1` reports an unsupported platform.
-
-The source of those two warnings was verified against the unchanged
-upstream vLLM base; there were no additional missing Python dependencies.
-The supplied pin list reproduces the tested package versions but does not
-include independent download hashes for all wheel artifacts.
+The prior qualified `repro-final` build on GB10 produced a 61-wheel
+(approximately 243 MiB) dependency overlay. Its `pip check` reported only
+the two issues already present in the official base: the NVIDIA NCCL version
+mismatch and the cuSPARSELt platform metadata warning. The updated procedure
+above has not yet been executed end-to-end; the newly built image requires a
+separate inference test before it can be described as qualified. Use the
+candidate image tag printed by the command in subsequent launch tests.
 
 ## Command
 
@@ -270,11 +348,17 @@ output WAV. The verified utterance yielded a relevant Chinese answer and
 For the repository's more general payload builder, see the
 [online client](../../examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py).
 
-## Measured latency and memory
+## Historical latency and memory (earlier local image)
 
-Measurements below are from **one** DGX Spark, the earlier local
-qualification image, and a single concurrent HTTP request. They are not Realtime TTFA or
-throughput numbers.
+These are historical measurements from **one** DGX Spark and the earlier
+local qualification image, with a single concurrent HTTP request. They are
+not measurements from the independently rebuilt `repro-final` image,
+Realtime TTFA, or throughput.
+
+The row marked `prior profile` used the earlier profile containing
+`duplex_session.server_vad_model_path`. The clean-profile measurements
+below are also from the earlier local image. Use the separate independently
+rebuilt image verification table for reproducible-image measurements.
 
 | Workload | Samples | Client completion time | Result |
 | --- | ---: | ---: | --- |
