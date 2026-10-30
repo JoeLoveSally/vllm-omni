@@ -71,8 +71,10 @@ runtime allocator measurements with their definitions clearly stated.
 ## Software environment
 
 - Base image: `vllm/vllm-openai:v0.29.0` (aarch64).
-- Independently built image: `vllm-omni:gb10-f1a6e7ce-repro-final`
-  (local qualification tag; not an upstream-published image).
+- Earlier independently built image: `vllm-omni:gb10-f1a6e7ce-repro-final`
+  (historical local qualification tag).
+- Newly reproduced and inference-tested candidate: `vllm-omni:gb10-repro-check-20261030132325-3382504`
+  (local Docker tag; not an upstream-published image).
 - Source: clean Git archive of upstream commit `f1a6e7ce`.
 - Python: 3.12.3; vLLM: 0.29.0; vLLM-Omni: `0.0.0.dev0+gf1a6e7ce`.
 - PyTorch: `2.13.0+cu130`; CUDA runtime: 13.0.
@@ -236,13 +238,22 @@ fi
 GB10_BUILD
 ```
 
-The prior qualified `repro-final` build on GB10 produced a 61-wheel
-(approximately 243 MiB) dependency overlay. Its `pip check` reported only
-the two issues already present in the official base: the NVIDIA NCCL version
-mismatch and the cuSPARSELt platform metadata warning. The updated procedure
-above has not yet been executed end-to-end; the newly built image requires a
-separate inference test before it can be described as qualified. Use the
-candidate image tag printed by the command in subsequent launch tests.
+The updated build procedure was executed end-to-end on an ARM64
+DGX Spark GB10. It generated a 61-wheel dependency overlay
+(approximately 243 MiB) and successfully built the candidate image.
+
+The rebuilt image's `pip check` output was identical to that of the
+official base image. The following two pre-existing findings remain:
+
+- PyTorch requires `nvidia-nccl-cu13==2.29.7`, but the base image
+  contains `nvidia-nccl-cu13==2.30.7`.
+- `nvidia-cusparselt-cu13==0.8.1` reports that it is unsupported
+  on this platform.
+
+No additional dependency findings were introduced by the overlay.
+The candidate image subsequently passed text and audio inference
+on the same GB10 host. Results are recorded in the independent
+image verification section below.
 
 ## Command
 
@@ -250,15 +261,48 @@ The validated one-device profile is stored at
 [`Qwen3-Omni-DGX-Spark-GB10.yaml`](Qwen3-Omni-DGX-Spark-GB10.yaml).
 It is derived from the previous three-stage profile by removing the legacy
 `duplex_session.server_vad_model_path` block, which the Chat Completions workload
-does not need. The original pre-seed qualification container mounted that profile and reported
-`/health` healthy; the host and container SHA256 checksums both returned:
+does not need.
+
+The checked-in profile, including Stage 1 `seed: 42`, was mounted
+in the seed-42 verification container. The host and container SHA256
+checksums both returned:
 
 ```text
-800a037b26fc37032d1b6ba3b825ad473ee6d7eb6f38c3ea4d356b713c4bb2d5
+1a1bff44d2e00412a501e567fac33d877b0c60c30875462e0055afaf39dec7c5
 ```
 
 The older text-request benchmark and first audio-input run used the profile
 with the VAD field, so do not present those measurements as clean-profile results.
+
+The SHA256 above identifies the checked-in profile, including Stage 1
+`seed: 42`. The previous SHA256
+
+`800a037b26fc37032d1b6ba3b825ad473ee6d7eb6f38c3ea4d356b713c4bb2d5`
+
+identifies the pre-seed profile and is retained only as a historical reference.
+
+Docker image tags in this recipe are local names, not upstream version
+identifiers. Earlier validation used `gb10-f1a6e7ce-repro-final` and
+`gb10-f1a6e7ce-closure-verified`. The independently rebuilt candidate
+uses `vllm-omni:gb10-repro-check-20261030132325-3382504`.
+
+The build script generates a timestamped candidate tag. Use the exact
+tag printed by the build when launching the candidate image. If a stable
+local alias is preferred, create one explicitly with:
+
+Set `CANDIDATE_IMAGE` to the exact timestamped tag printed by the
+build command, then create the stable alias:
+
+`CANDIDATE_IMAGE="<candidate-image-tag>"; docker image tag "$CANDIDATE_IMAGE" vllm-omni:gb10-f1a6e7ce-repro-final`
+
+Replace `<candidate-image-tag>` with the actual tag printed by the
+build. This command only creates a local alias; it does not rebuild
+or modify the candidate image.
+
+The launch command below uses this stable alias. Before running it,
+execute the tagging command above. Alternatively, replace the image
+reference in the launch command with the exact timestamped candidate tag.
+The alias is a local Docker tag and does not change the image contents.
 
 Replace `/path/to/model` and `/path/to/profile` with local paths:
 
@@ -389,20 +433,48 @@ The following requests ran with the same pinned GB10 YAML and one
 concurrent `/v1/chat/completions` HTTP request. Latencies are end-to-end
 complete-response times, **not** time-to-first-audio.
 
-| Image | Input | First measured request | Subsequent warm requests |
-| --- | --- | ---: | --- |
-| `repro-test` | Text | 38.775 s | 1.736 s, 1.610 s |
-| `repro-test` | WAV | 41.079 s | 2.078 s, 2.100 s |
-| `repro-final` | Text | 36.284 s | Not measured |
-| `repro-final` | WAV | 38.960 s | Not measured |
+| Image | Input | Recorded complete-response time(s) |
+| --- | --- | --- |
+| `repro-test` | Text | 38.775 s; 1.736 s, 1.610 s (warm repeats) |
+| `repro-test` | WAV | 41.079 s; 2.078 s, 2.100 s (warm repeats) |
+| `repro-final` | Text | 36.284 s |
+| `repro-final` | WAV | 38.960 s |
+| `gb10-repro-check-20261030132325-3382504` | Text | 1.787 s |
+| `gb10-repro-check-20261030132325-3382504` | WAV | 40.088 s (first audio-input request); 2.041 s (repeat) |
 
-Both rebuilt images returned Chinese text and valid 24 kHz mono speech.
-The audio-input fixture contained the spoken codename "Orchid Falcon",
-which the model recovered correctly. Long first-request times are
-consistent with one-time warm-up, but the precise cause was not
-independently established. The warm timings were measured on `repro-test`
-before the final `onnx`/`pre-commit` dependency additions, not on
-`repro-final`. Neither multi-turn history nor Realtime duplex was tested.
+The candidate text request was measured after earlier text/audio regression
+requests had already been served by the same running container. It is not a
+cold-start measurement. The WAV measurements represent the first and repeated
+audio-input requests in the candidate regression sequence.
+
+The newly reproduced candidate was
+`vllm-omni:gb10-repro-check-20261030132325-3382504` with image ID `sha256:3bed8329050ebd4dff1daffbdb9a2676d96fe6266ca934cf9ff5c4c731367001`.
+It was built from the pinned upstream source commit
+`f1a6e7ce2a8fceb1417ec86b0b49a6386601ac65` and the official
+`vllm/vllm-openai:v0.29.0` ARM64 base image.
+
+The candidate container mounted the seed-42 GB10 YAML.
+The host and container configuration SHA256 both matched
+`1a1bff44d2e00412a501e567fac33d877b0c60c30875462e0055afaf39dec7c5`.
+
+The text request returned HTTP 200, Chinese text and a valid
+4.137 s speech output. Its complete HTTP response time was 1.787 s.
+This request was measured after earlier regression requests on the same
+running container, not during a cold start.
+
+The audio-input fixture contained the spoken codename "Orchid Falcon".
+Both audio-input requests returned the expected Thinker text.
+The first audio-input request in this sequence took 40.088 s and
+generated 4.297 s of speech. The repeated audio-input request took
+2.041 s and generated 3.977 s of speech.
+
+All three generated WAV files were validated as 24 kHz mono PCM16.
+
+The timings measure complete HTTP responses, not time to first audio.
+The first and repeated audio requests are individual observations,
+not a throughput benchmark. The earlier `repro-test` warm timings
+were measured before the final `onnx`/`pre-commit` dependency additions.
+Neither multi-turn history nor Realtime duplex was tested.
 
 ### Stage 1 sampling seed validation (2026-10-30)
 
