@@ -47,6 +47,7 @@ stages:
       from_stage_0: connector_of_shared_memory
 
     default_sampling_params:
+      seed: 42
       temperature: 0.9
       top_k: 50
       max_tokens: 4096

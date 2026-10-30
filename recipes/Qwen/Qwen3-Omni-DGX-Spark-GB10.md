@@ -172,7 +172,7 @@ The validated one-device profile is stored at
 [`Qwen3-Omni-DGX-Spark-GB10.yaml`](Qwen3-Omni-DGX-Spark-GB10.yaml).
 It is derived from the previous three-stage profile by removing the legacy
 `duplex_session.server_vad_model_path` block, which the Chat Completions workload
-does not need. The running container mounted this exact file and reported
+does not need. The original pre-seed qualification container mounted that profile and reported
 `/health` healthy; the host and container SHA256 checksums both returned:
 
 ```text
@@ -319,6 +319,44 @@ consistent with one-time warm-up, but the precise cause was not
 independently established. The warm timings were measured on `repro-test`
 before the final `onnx`/`pre-commit` dependency additions, not on
 `repro-final`. Neither multi-turn history nor Realtime duplex was tested.
+
+### Stage 1 sampling seed validation (2026-10-30)
+
+The GB10 recipe now sets `seed: 42` for Stage 1 (Talker),
+matching the upstream sampling configuration fix in #7474.
+
+The updated profile was tested on a single DGX Spark GB10 using
+`vllm-omni:gb10-f1a6e7ce-closure-verified`, without rebuilding
+the image. The host and container SHA256 matched:
+
+```text
+1a1bff44d2e00412a501e567fac33d877b0c60c30875462e0055afaf39dec7c5
+```
+
+| Request | Completion time | Result |
+| --- | ---: | --- |
+| Text to text + audio | 38.430 s | Passed |
+| WAV to text + audio, first run | 39.544 s | Passed |
+| Same WAV, repeated | 2.239 s | Passed |
+
+All three requests returned the expected text and valid
+24 kHz mono PCM16 speech. Both audio-input requests returned the
+expected Thinker response mentioning "Orchid Falcon".
+
+Whisper Small transcribed the first generated audio as
+"RG 的 FACON" and the second as "Orchid Falcon".
+Manual listening found both outputs intelligible, with the
+first codename pronunciation less clear than the second.
+No obvious speech degeneration was observed.
+
+The two audio outputs differed in duration (3.497 s versus
+4.617 s) and SHA256. These observations establish functional
+regression coverage, not bitwise deterministic audio or a measured
+reduction in Talker degeneration rate.
+
+Times measure complete HTTP responses, not time to first audio.
+The original pre-seed qualification measurements above remain
+historical observations and must not be relabeled as seeded results.
 
 ## Notes
 
