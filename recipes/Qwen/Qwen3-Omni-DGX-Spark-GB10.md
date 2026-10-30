@@ -311,6 +311,7 @@ Replace `/path/to/model` and `/path/to/profile` with local paths:
 docker image inspect vllm-omni:gb10-f1a6e7ce-repro-final >/dev/null
 
 # Validated GB10 profile; use the named file in this recipe.
+# Requires the alias above; otherwise change both image references to the printed candidate tag.
 docker run --rm --name qwen3-omni-gb10 \
   --gpus all --ipc host --network host \
   -v /path/to/model:/models/Qwen3-Omni-30B-A3B-Instruct:ro \
@@ -446,6 +447,9 @@ The candidate text request was measured after earlier text/audio regression
 requests had already been served by the same running container. It is not a
 cold-start measurement. The WAV measurements represent the first and repeated
 audio-input requests in the candidate regression sequence.
+The first WAV request (40.088 s) is the first audio-input-path observation,
+not a cold server start, and is not directly comparable to the warm text
+request (1.787 s).
 
 The newly reproduced candidate was
 `vllm-omni:gb10-repro-check-20261030132325-3382504` with image ID `sha256:3bed8329050ebd4dff1daffbdb9a2676d96fe6266ca934cf9ff5c4c731367001`.
